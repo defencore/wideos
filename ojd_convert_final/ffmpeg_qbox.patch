@@ -1,0 +1,521 @@
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 7a2d00fb45..3751557922 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -197,6 +197,7 @@ OBJS-$(CONFIG_PCM_U32LE_MUXER)           += raw.o
+ OBJS-$(CONFIG_PCM_U8_DEMUXER)            += raw.o
+ OBJS-$(CONFIG_PCM_U8_MUXER)              += raw.o
+ OBJS-$(CONFIG_PVA_DEMUXER)               += pva.o
++OBJS-$(CONFIG_QBOX_DEMUXER)              += qbox.o
+ OBJS-$(CONFIG_QCP_DEMUXER)               += qcp.o
+ OBJS-$(CONFIG_R3D_DEMUXER)               += r3d.o
+ OBJS-$(CONFIG_RAWVIDEO_DEMUXER)          += raw.o
+diff --git a/libavformat/allformats.c b/libavformat/allformats.c
+index 27a955594b..acae9ee519 100644
+--- a/libavformat/allformats.c
++++ b/libavformat/allformats.c
+@@ -164,6 +164,7 @@ void av_register_all(void)
+     REGISTER_MUXDEMUX (PCM_U8,    pcm_u8);
+     REGISTER_MUXER    (PSP, psp);
+     REGISTER_DEMUXER  (PVA, pva);
++    REGISTER_DEMUXER  (QBOX, qbox);
+     REGISTER_DEMUXER  (QCP, qcp);
+     REGISTER_DEMUXER  (R3D, r3d);
+     REGISTER_MUXDEMUX (RAWVIDEO, rawvideo);
+diff --git a/libavformat/qbox.c b/libavformat/qbox.c
+new file mode 100644
+index 0000000000..5bed297c9d
+--- /dev/null
++++ b/libavformat/qbox.c
+@@ -0,0 +1,380 @@
++/*
++ * Mobilygen/Maxim QBOX demuxer
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "libavutil/intreadwrite.h"
++#include "avformat.h"
++#include "qbox.h"
++#include "libavcodec/bytestream.h"
++#include "libavutil/bswap.h"
++#include "libavcodec/bytestream.h"
++#include "libavcodec/mpeg4audio.h"
++
++#undef QBOX_EXTRA_DEBUG
++
++typedef struct qboxDemux {
++    qboxContext qbox;
++    qboxContext firstVideoQbox;
++    int fr_num;
++    int fr_den;
++    int from_header;
++    int got_audio;
++    int got_video;
++    int audio_stream_idx;
++    int video_stream_idx;
++} qboxDemux;
++
++/*
++ * The following functions constitute our interface to the world
++ */
++
++/* parse first 6x4 bytes of header
++ * TODO: parse headers with extensions (may be longer)
++ *
++ */
++int ff_qbox_parse(qboxContext *qbox, uint8_t *input_data, int data_size)
++{
++    const uint8_t *src = input_data;
++
++    if (!(input_data[4] == 'q' && input_data[5] == 'b' && input_data[6] == 'o'  && input_data[7] == 'x' ))
++        return 0;
++
++    if(data_size < QBOX_HDR_SIZE)
++        return 0;
++
++
++    qbox->qbox_size = bytestream_get_be32(&src);
++    if(qbox->qbox_size < QBOX_HDR_SIZE)
++        return 0;
++
++    qbox->qbox_size-=QBOX_HDR_SIZE;
++    bytestream_get_be32(&src); //qbox
++    qbox->version = bytestream_get_byte(&src);
++    qbox->boxflags = bytestream_get_be24(&src);
++    qbox->sample_stream_type = bytestream_get_be16(&src);
++    qbox->sample_stream_id = bytestream_get_be16(&src);
++    qbox->sample_flags = bytestream_get_be32(&src);
++    qbox->sample_cts = bytestream_get_be32(&src);
++    qbox->data = input_data + QBOX_HDR_SIZE;
++    return qbox->qbox_size;
++}
++
++/** create h264 startcodes (by default there's nalu lengths in uint32_be format)
++ */
++int ff_qbox_make_startcode(uint8_t *ptr, int input_data)
++{
++    uint32_t size;
++    uint8_t *ptr_tmp = ptr;
++    while (ptr_tmp - ptr < input_data - 4) {
++        size = be2me_32(*(uint32_t *) ptr_tmp);
++        ptr_tmp[0] = 0x00;
++        ptr_tmp[1] = 0x00;
++        ptr_tmp[2] = 0x00;
++        ptr_tmp[3] = 0x01;
++        ptr_tmp+=4+size;
++    }
++    return 1;
++}
++
++
++/*
++ * demuxer probe:
++ * first 4 bytes of every qbox - is full qbox length
++ * next 4 bytes - chars "qbox", try find them
++ */
++static int qbox_probe(AVProbeData * p) {
++    const uint8_t *d;
++    d = p->buf;
++    if (d[4] == 'q' && d[5] == 'b' && d[6] == 'o'  && d[7] == 'x' ) {
++        return AVPROBE_SCORE_MAX;
++    }
++    return 0;
++}
++
++
++/*
++ * probably there's no header, just stream with qboxes,
++ * if qbox flagged with CONFIGURATION_INFO, there's chance to get AudioSpecificConfig or SPS/PPS
++ * frames skipped until both audio & video seen
++ * */
++static int qbox_read_header(AVFormatContext *s, AVFormatParameters *ap) {
++    qboxDemux *d = s->priv_data;
++    qboxContext *c = &d->qbox;
++    ByteIOContext *pb = s->pb;
++    MPEG4AudioConfig cfg;
++    AVStream *st;
++    uint8_t qbox_header[QBOX_HDR_SIZE];
++
++    memset(d, 0, sizeof(qboxDemux)); // extra precation, this should be 0 already
++
++    do {
++        if(d->got_audio && d->got_video)
++            return 0;
++
++        if(!get_buffer(pb, qbox_header, QBOX_HDR_SIZE))
++            return AVERROR(EIO);
++
++        if(!ff_qbox_parse(c, qbox_header, QBOX_HDR_SIZE))
++        {
++            av_log(s, AV_LOG_ERROR, "failed to parse qbox!\n");
++            return AVERROR(EIO);
++        }
++
++        switch (c->sample_stream_type) {
++            case SAMPLE_TYPE_AAC:
++                if (c->sample_flags & SAMPLE_FLAGS_CONFIGURATION_INFO) {
++                    d->audio_stream_idx = s->nb_streams;
++                    if (!(st = av_new_stream(s, 1)))
++                        return AVERROR(ENOMEM);
++                    st->codec->codec_type = CODEC_TYPE_AUDIO;
++                    st->codec->codec_id   = CODEC_ID_AAC;
++
++                    if(c->sample_flags & SAMPLE_FLAGS_PADDING_MASK)
++                    {
++                        uint8_t padsize = (c->sample_flags & SAMPLE_FLAGS_PADDING_MASK) >> 30; // bits 30-31 specify padding
++
++                        av_log(s, AV_LOG_WARNING, "Padding mask found in header!\n");
++
++                        c->qbox_size -= padsize;
++                        url_fskip(pb, padsize);
++                    }
++
++                    st->codec->extradata_size = c->qbox_size;
++                    st->codec->extradata = av_malloc(st->codec->extradata_size);
++                    get_buffer(pb, st->codec->extradata, st->codec->extradata_size);
++                    ff_mpeg4audio_get_config(&cfg, st->codec->extradata,
++                                             st->codec->extradata_size);
++                    st->codec->channels = cfg.channels;
++                    st->codec->sample_rate = cfg.sample_rate;
++
++                    // TODO: need to set from external
++                    // pts is set from qbox sample_cts, so it's 32 bits in size (pts_wrap_bits==32)
++                    if(ap->sample_rate == 25) {
++                        av_set_pts_info(st, 32, 3600, 90000);
++                    } else if(ap->sample_rate == 30) {
++                        av_set_pts_info(st, 32, 3001, 90000);
++                    } else {
++                        av_set_pts_info(st, 32, 1, 90000); // default, 90kHz resolution
++                    }
++                }
++                d->got_audio=1;
++                break;
++            case SAMPLE_TYPE_PCM:
++                d->audio_stream_idx = s->nb_streams;
++                if (!(st = av_new_stream(s, 1)))
++                    return AVERROR(ENOMEM);
++                st->codec->codec_type = CODEC_TYPE_AUDIO;
++                st->codec->codec_id   = CODEC_ID_PCM_S16BE;
++                /* these 3 parameters have to be set up by higher level functions */
++                st->codec->channels = 2;
++                st->codec->sample_rate = 48000;
++                
++                // pts is set from qbox sample_cts, so it's 32 bits in size (pts_wrap_bits==32)
++                if(ap->sample_rate == 25) {
++                    av_set_pts_info(st, 32, 3600, 90000);
++                } else if(ap->sample_rate == 30) {
++                    av_set_pts_info(st, 32, 3001, 90000);
++                } else {
++                    av_set_pts_info(st, 32, 1, 90000); // default, 90kHz resolution
++                }
++
++                url_fskip(pb, c->qbox_size); // TODO: use PCM first qbox contents too
++                d->got_audio=1;
++#ifdef QBOX_EXTRA_DEBUG
++                av_log(s, AV_LOG_DEBUG, "got_audio\n");
++#endif
++                break;
++            case SAMPLE_TYPE_H264:
++                if (c->sample_flags & SAMPLE_FLAGS_CONFIGURATION_INFO) {
++                    d->video_stream_idx = s->nb_streams;
++                    if (!(st = av_new_stream(s, 0)))
++                        return AVERROR(ENOMEM);
++                    st->codec->codec_type = CODEC_TYPE_VIDEO;
++                    st->codec->codec_id   = CODEC_ID_H264;
++
++                    if(c->sample_flags & SAMPLE_FLAGS_PADDING_MASK)
++                    {
++                        uint8_t padsize = (c->sample_flags & SAMPLE_FLAGS_PADDING_MASK) >> 30; // bits 30-31 specify padding
++
++                        av_log(s, AV_LOG_WARNING, "Padding mask found in header!\n");
++
++                        c->qbox_size -= padsize;
++                        url_fskip(pb, padsize);
++                    }
++
++                    st->codec->extradata_size = c->qbox_size;
++                    st->codec->extradata = av_malloc(st->codec->extradata_size);
++                    get_buffer(pb, st->codec->extradata, st->codec->extradata_size);
++                    ff_qbox_make_startcode(st->codec->extradata, st->codec->extradata_size);
++
++                    // extradata can be used as the first pkt too! It might contain video data.
++                    c->data = st->codec->extradata;
++                    // Back up qbox to use it in first packet
++                    d->firstVideoQbox = *c;
++                    
++                    /* TODO: set aspect ratio */
++                    
++                    // pts is set from qbox sample_cts, so it's 32 bits in size (pts_wrap_bits==32)
++                    if(ap->sample_rate == 25) {
++                        av_set_pts_info(st, 32, 3600, 90000);
++                    } else if(ap->sample_rate == 30) {
++                        av_set_pts_info(st, 32, 3001, 90000);
++                    } else {
++                        av_set_pts_info(st, 32, 1, 90000); // default, 90kHz resolution
++                    }
++                }
++                if(d->got_video==1) {
++                    /* looks like qboxes without sound
++                     * change pts info */
++                    av_set_pts_info(s->streams[0], 32, 2500, 100);
++                    d->got_audio=1;
++                    d->from_header=1;
++                }
++                /* audio detecting given chance, but got 2 frames of video, seems there's no audio... */
++                d->got_video=1;
++#ifdef QBOX_EXTRA_DEBUG
++                av_log(s, AV_LOG_DEBUG, "got_video\n");
++#endif
++                break;
++            default:
++                av_log(s, AV_LOG_ERROR, "unknown qbox: s:%d t:0x%08x id:%08x f:%08x cts:%d\n",
++                    c->qbox_size, c->sample_stream_type, c->sample_stream_id, c->sample_flags, c->sample_cts);
++                url_fskip(pb, c->qbox_size);
++                break;
++        }
++    } while(c->sample_flags & SAMPLE_FLAGS_CONFIGURATION_INFO);
++    return 0;
++}
++
++
++/*
++ * extradata set, create packets from qboxes
++ * */
++static int qbox_read_packet(AVFormatContext *s, AVPacket *pkt) {
++    qboxDemux *d = s->priv_data;
++    qboxContext *c = &d->qbox;
++    ByteIOContext *pb = s->pb;
++    uint8_t qbox_header[QBOX_HDR_SIZE];
++    int ret = 0;
++
++    if (d->firstVideoQbox.data != NULL)
++    {
++        // A bit hacky, but it will do. The first packet can be set from the NAL
++        // units of the header, if present.
++
++        if(av_new_packet(pkt, d->firstVideoQbox.qbox_size) < 0)
++        {
++            av_log(s, AV_LOG_ERROR, "Failed to create first packet!\n");
++            return AVERROR(ENOMEM);
++        }
++
++        memcpy(pkt->data, d->firstVideoQbox.data, d->firstVideoQbox.qbox_size);
++
++        *c = d->firstVideoQbox; // copy to current qbox
++
++        d->firstVideoQbox.data = NULL; // set to NULL to avoid using it again
++    }
++    else
++    {
++        if(!d->from_header) {
++            if(!get_buffer(pb, qbox_header, QBOX_HDR_SIZE))
++                return AVERROR(EIO);
++
++            if(!ff_qbox_parse(c, qbox_header, QBOX_HDR_SIZE))
++                return AVERROR(EIO);
++        } else {
++            // This handles one specific case - a no-audio stream; without this
++            // parsing would fail on the first qbox after the video config.
++            d->from_header=0;
++        }
++
++#ifdef QBOX_EXTRA_DEBUG
++        av_log(s, AV_LOG_DEBUG, "qbox: s:%d t:0x%08x id:%08x f:%08x cts:%d\n",
++                c->qbox_size, c->sample_stream_type, c->sample_stream_id, c->sample_flags, c->sample_cts);
++#endif
++        
++        if(c->sample_flags & SAMPLE_FLAGS_PADDING_MASK)
++        {
++            uint8_t padsize = (c->sample_flags & SAMPLE_FLAGS_PADDING_MASK) >> 30; // bits 30-31 specify padding
++
++            av_log(s, AV_LOG_WARNING, "Padding mask found!\n");
++
++            c->qbox_size -= padsize;
++            url_fskip(pb, padsize);
++        }
++
++        if((ret = av_get_packet(pb, pkt, c->qbox_size)) <= 0 || ret < c->qbox_size)
++        {
++            av_log(s, AV_LOG_ERROR, "Failed to read qbox contents (size %d)! ret = %d\n", c->qbox_size, ret);
++            return AVERROR(EIO);
++        }
++    }
++
++    if(c->sample_flags & SAMPLE_FLAGS_CTS_PRESENT)
++        pkt->dts = c->sample_cts;
++    else
++        pkt->dts = AV_NOPTS_VALUE;
++    pkt->pts = pkt->dts;
++
++    if(c->sample_flags & SAMPLE_FLAGS_SYNC_POINT)
++        pkt->flags |= PKT_FLAG_KEY;
++
++    if(c->sample_flags & SAMPLE_FLAGS_CONFIGURATION_INFO)
++        av_log(s, AV_LOG_WARNING, "Config info frame found!\n");
++
++    // TODO: figure out how to handle these 2 cases!
++    if(c->sample_flags & SAMPLE_FLAGS_DISPOSABLE)
++        av_log(s, AV_LOG_ERROR, "B frame found!\n");
++    if(c->sample_flags & SAMPLE_FLAGS_MUTE)
++        av_log(s, AV_LOG_ERROR, "Mute command found!\n");
++
++    if(!(c->boxflags & BOX_FLAGS_SAMPLE_DATA_PRESENT) || (c->qbox_size == 0))
++    {
++        av_log(s, AV_LOG_ERROR, "Empty qbox found!\n");
++
++        // Try to skip empty qboxes
++        return qbox_read_packet(s, pkt);
++    }
++
++    switch (c->sample_stream_type) {
++        case SAMPLE_TYPE_QMA:
++        case SAMPLE_TYPE_PCM:
++        case SAMPLE_TYPE_AAC:
++            pkt->stream_index = d->audio_stream_idx;
++            break;
++        case SAMPLE_TYPE_H264:
++            pkt->stream_index = d->video_stream_idx;
++            ff_qbox_make_startcode(pkt->data, pkt->size);
++            break;
++        default:
++            av_log(s, AV_LOG_ERROR, "Unknown qbox\n");
++            return 0; 
++    }
++    return ret;
++}
++
++
++AVInputFormat qbox_demuxer = {
++    "qbox",
++    NULL_IF_CONFIG_SMALL("qbox stream raw format"),
++    sizeof(qboxDemux),
++    qbox_probe,
++    qbox_read_header,
++    qbox_read_packet,
++};
+diff --git a/libavformat/qbox.h b/libavformat/qbox.h
+new file mode 100644
+index 0000000000..93a4685b8b
+--- /dev/null
++++ b/libavformat/qbox.h
+@@ -0,0 +1,72 @@
++/*
++ * Mobilygen/Maxim QBOX demuxer
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef QBOX_H_
++#define QBOX_H_
++
++#define QBOX_HDR_SIZE (6*4)
++
++enum {
++    SAMPLE_TYPE_AAC = 0x1,
++    SAMPLE_TYPE_H264,
++    SAMPLE_TYPE_PCM,
++    SAMPLE_TYPE_DEBUG,
++    SAMPLE_TYPE_H264_SLICE,
++    SAMPLE_TYPE_QMA,
++    SAMPLE_TYPE_VIN_STATS_GLOBAL,
++    SAMPLE_TYPE_VIN_STATS_MB,
++    SAMPLE_TYPE_Q711,
++    SAMPLE_TYPE_Q728,
++    SAMPLE_TYPE_MAX,
++};
++
++
++#define BOX_FLAGS_SAMPLE_DATA_PRESENT 0x01
++#define BOX_FLAGS_LAST_SAMPLE_IN_STREAM 0x02
++
++#define SAMPLE_FLAGS_CONFIGURATION_INFO 0x01
++#define SAMPLE_FLAGS_CTS_PRESENT 0x02
++#define SAMPLE_FLAGS_SYNC_POINT 0x04
++#define SAMPLE_FLAGS_DISPOSABLE 0x08
++#define SAMPLE_FLAGS_MUTE 0x10
++#define SAMPLE_FLAGS_BASE_CTS_INCREMENT 0x20
++#define SAMPLE_FLAGS_META_INFO 0x40
++#define SAMPLE_FLAGS_END_OF_SEQUENCE 0x80
++#define SAMPLE_FLAGS_END_OF_STREAM 0x100
++#define SAMPLE_FLAGS_PADDING_MASK 0xC0000000
++
++typedef struct qboxContext {
++    uint32_t qbox_size; ///< will be decreased
++    uint32_t boxflags;
++    uint8_t  version;
++    uint16_t sample_stream_type;
++    uint16_t sample_stream_id;
++    uint32_t sample_flags;
++    uint32_t sample_cts;
++    uint8_t  *data;
++} qboxContext;
++
++int ff_qbox_parse(qboxContext *qbox, uint8_t *input_data, int data_size);
++int ff_qbox_make_startcode(uint8_t *ptr, int input_data);
++
++
++
++#endif /* QBOX_H_ */
++
+diff --git a/libavformat/utils.c b/libavformat/utils.c
+index b73d98473f..a6097c39f3 100644
+--- a/libavformat/utils.c
++++ b/libavformat/utils.c
+@@ -2273,13 +2273,14 @@ int av_find_stream_info(AVFormatContext *ic)
+         read_size += pkt->size;
+ 
+         st = ic->streams[pkt->stream_index];
+-        if(st->codec_info_nb_frames>1) {
++        // HACK for qbox: this seems to mess with both audio and video when converting qbox.
++        /*if(st->codec_info_nb_frames>1) {
+             if (st->time_base.den > 0 && av_rescale_q(codec_info_duration[st->index], st->time_base, AV_TIME_BASE_Q) >= ic->max_analyze_duration){
+                 av_log(ic, AV_LOG_WARNING, "max_analyze_duration reached\n");
+                 break;
+             }
+             codec_info_duration[st->index] += pkt->duration;
+-        }
++        }*/
+             st->codec_info_nb_frames++;
+ 
+         {
+@@ -2762,9 +2763,9 @@ static int compute_pkt_fields2(AVFormatContext *s, AVStream *st, AVPacket *pkt){
+         pkt->dts= st->pts_buffer[0];
+     }
+ 
+-    if(st->cur_dts && st->cur_dts != AV_NOPTS_VALUE && st->cur_dts >= pkt->dts){
++    if(st->cur_dts && st->cur_dts != AV_NOPTS_VALUE && st->cur_dts > pkt->dts){ // HACK: the famous patch from https://trac.ffmpeg.org/ticket/177
+         av_log(s, AV_LOG_ERROR,
+-               "st:%d error, non monotone timestamps %"PRId64" >= %"PRId64"\n",
++               "st:%d error, non monotone timestamps %"PRId64" > %"PRId64"\n",
+                st->index, st->cur_dts, pkt->dts);
+         return -1;
+     }
