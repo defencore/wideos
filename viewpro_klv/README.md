@@ -15,6 +15,7 @@
 - [Viewpro Tracking Series Gimbal Camera - Ethernet Encoding Meta Data Instruction](http://www.viewprotech.com/upfile/2022/11/20221121201032_340.pdf)
 - [MISB_Standard_0601.pdf](https://upload.wikimedia.org/wikipedia/commons/1/19/MISB_Standard_0601.pdf)
 - [MISB 0601 supported keys](https://www.impleotv.com/content/klvinspector/help/page_supported_keys.html)
+- [ViewPro A40 Pro](https://www.viewproonline.com/products/a40-pro-40x-optical-zoom-ai-tracking-3axis-gimbal-camera)
 
 ## Tested on:
 - [VQ40TPRO](http://www.viewprotech.com/index.php?ac=article&at=read&did=517)
