@@ -11,9 +11,13 @@
 └─$ cat KLV_from_ViewPro_camera.bin | xxd -p | ./extract.sh
 ```
 
-References:
+## References:
 - [Viewpro Tracking Series Gimbal Camera - Ethernet Encoding Meta Data Instruction](http://www.viewprotech.com/upfile/2022/11/20221121201032_340.pdf)
 - [MISB_Standard_0601.pdf](https://upload.wikimedia.org/wikipedia/commons/1/19/MISB_Standard_0601.pdf)
 
-Tested on:
+## Tested on:
 - VQ40TPRO
+
+## ToDo:
+- Checksum Checker (to skip invalid messages)
+- Rewrite to python
